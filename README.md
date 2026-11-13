@@ -5,6 +5,24 @@ placement/lifecycle, execution, and position-keeping for client portfolios,
 on PostgreSQL. This is the OLTP counterpart to the sibling
 [fin-analytics-api](https://github.com/SaaSGun/fin-analytics-api) repo.
 
+## Live demo
+
+Deployed on Cloud Run: **https://fin-oms-api-miatwtkcba-ez.a.run.app**
+
+- [`/health`](https://fin-oms-api-miatwtkcba-ez.a.run.app/health) —
+  unauthenticated, confirms the service is up.
+- [`/docs`](https://fin-oms-api-miatwtkcba-ez.a.run.app/docs) — interactive
+  Swagger UI for the full API surface (every endpoint, request/response
+  schemas, scopes required).
+
+No API key is published here deliberately — this is a live production-like
+deployment with a real database behind it, and a key committed to a public
+repo is effectively public forever (scraped within minutes, even after
+later revoking it), so a write-capable key here would mean strangers
+mutating the same demo data. `/docs` is enough to see the full request/
+response shape, the pagination envelope, and the `401`/`403` behavior of
+the auth layer (`app/auth.py`) without needing one.
+
 ## The concurrency-control story (the point of this repo)
 
 Two mechanics carry the weight here, used side by side on purpose because
