@@ -3,12 +3,9 @@ before filling or cancelling an order. Reads outnumber writes, mirroring
 how a PM actually works.
 
 One of the write tasks (place_concentrated_order) deliberately targets
-the instrument with a seeded ConcentrationLimit, to surface - under
-organic concurrent load, not just the isolated repro in
-concurrency_probe.py - the known race documented in .claude/context.md:
-the concentration-limit check has no locking/reservation, so concurrent
-BUY orders can collectively blow past the limit even though each one
-individually passed the check.
+the instrument with a seeded ConcentrationLimit, so the limit is exercised
+under organic concurrent load, not just the isolated race in
+concurrency_probe.py.
 
 Keys/IDs come from scripts/provision_load_test_keys.py's output (default
 loadtest/.keys.json). Run it first, then e.g.:

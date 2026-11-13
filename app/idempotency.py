@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import BigInteger, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.idempotency import IdempotencyKey
@@ -52,9 +52,14 @@ def require_idempotency_key(request: Request) -> str:
 async def check_replay(
     session: AsyncSession, *, client_name: str, key: str, method: str, path: str, request_hash: str
 ) -> dict | None:
-    """Call before invoking the service. Returns {"status": int, "body":
-    dict} if this exact request already completed; raises 409 on a
-    reused key with a different body; returns None on a fresh key."""
+    """Call before invoking the service, in the same transaction. Returns
+    {"status": int, "body": dict} if this exact request already completed;
+    raises 409 on a reused key with a different body; returns None on a
+    fresh key. A concurrent duplicate blocks on the key's lock until the
+    original commits, then replays it instead of re-running the operation."""
+    scope = f"{client_name}\0{key}\0{method}\0{path}".encode()
+    lock_id = int.from_bytes(hashlib.sha256(scope).digest()[:8], "big", signed=True)
+    await session.execute(select(func.pg_advisory_xact_lock(literal(lock_id, BigInteger))))
     result = await session.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.client_name == client_name,

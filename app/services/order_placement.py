@@ -17,7 +17,7 @@ app/services/cancellation.py for how a reservation is released.
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit import record_audit, snapshot
@@ -101,13 +101,16 @@ async def place_order(
 
     # 2. Concentration limit check — BUY only, a SELL only reduces concentration.
     if side == OrderSide.BUY:
-        limit_row = await _get_concentration_limit(session, account_id, instrument_id, instrument.asset_class)
+        # Locked until commit: concurrent BUYs against this limit are admitted one at a time, first come first served.
+        limit_row = await _lock_concentration_limit(session, account_id, instrument_id, instrument.asset_class)
         if limit_row is not None:
-            position = await session.get(Position, (account_id, instrument_id))
-            current_qty = position.quantity if position is not None else Decimal(0)
+            current_qty = await _exposure(session, account_id, instrument_id, exclude_order_id=order.id)
             projected_qty = current_qty + quantity
             if projected_qty > limit_row.max_position_quantity:
-                detail = f"projected position {projected_qty} exceeds limit {limit_row.max_position_quantity}"
+                detail = (
+                    f"projected exposure {projected_qty} (held + open BUY orders) "
+                    f"exceeds limit {limit_row.max_position_quantity}"
+                )
                 checks.append(
                     ComplianceCheck(
                         order_id=order.id,
@@ -229,17 +232,44 @@ async def place_order(
     return order
 
 
-async def _get_concentration_limit(
+async def _lock_concentration_limit(
     session: AsyncSession, account_id: uuid.UUID, instrument_id: uuid.UUID, asset_class: str
 ) -> ConcentrationLimit | None:
     result = await session.execute(
-        select(ConcentrationLimit).where(
+        select(ConcentrationLimit)
+        .where(
             ConcentrationLimit.account_id == account_id,
             (ConcentrationLimit.instrument_id == instrument_id)
             | (ConcentrationLimit.instrument_id.is_(None) & (ConcentrationLimit.asset_class == asset_class)),
         )
+        .order_by(ConcentrationLimit.id)  # fixed lock order across transactions, so no deadlocks
+        .with_for_update()
     )
     return result.scalars().first()
+
+
+async def _exposure(
+    session: AsyncSession, account_id: uuid.UUID, instrument_id: uuid.UUID, exclude_order_id: uuid.UUID
+) -> Decimal:
+    # One statement, one snapshot: a fill committing mid-check can't be counted twice or missed.
+    held = (
+        select(Position.quantity)
+        .where(Position.account_id == account_id, Position.instrument_id == instrument_id)
+        .scalar_subquery()
+    )
+    open_buys = (
+        select(func.sum(Order.quantity - Order.filled_quantity))
+        .where(
+            Order.account_id == account_id,
+            Order.instrument_id == instrument_id,
+            Order.side == OrderSide.BUY.value,
+            Order.status.in_((OrderStatus.NEW.value, OrderStatus.PARTIALLY_FILLED.value)),
+            Order.id != exclude_order_id,
+        )
+        .scalar_subquery()
+    )
+    result = await session.execute(select(func.coalesce(held, 0) + func.coalesce(open_buys, 0)))
+    return result.scalar_one()
 
 
 async def _reject(

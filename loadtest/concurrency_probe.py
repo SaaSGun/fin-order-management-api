@@ -1,21 +1,14 @@
 """Deliberately races requests against this API's concurrency guarantees
-to check whether they hold under genuine parallelism, not just
-sequentially. See .claude/context.md for the full write-up, including two
-known gaps this is built to demonstrate precisely, not just check:
+to check that they hold under genuine parallelism, not just sequentially:
 
-1. Idempotency race: two simultaneous requests with the identical
-   Idempotency-Key don't cleanly replay - the second hits the
-   idempotency_keys unique constraint after unblocking from the
-   cash-balance lock, and comes back as a bare 500 (app/idempotency.py,
-   app/routers/orders.py).
-2. Concentration-limit race: the concentration-limit check has no
-   locking/reservation, so concurrent BUY orders for the same instrument
-   can collectively exceed the limit even though each individually
-   passed it (app/services/order_placement.py).
-
-The ETag/If-Match optimistic-lock check is expected to hold (it's built
-on a conditional UPDATE ... WHERE version = :expected, which Postgres
-serializes correctly on its own).
+1. Idempotency race: simultaneous requests with the identical
+   Idempotency-Key must all replay the same single order, never 500
+   (app/idempotency.py's per-key advisory lock).
+2. ETag race: simultaneous cancels with the same If-Match must yield
+   exactly one 200, the rest 412 (app/services/cancellation.py).
+3. Concentration-limit race: simultaneous BUY orders that each fit the
+   limit alone but not together must not all be admitted
+   (app/services/order_placement.py's locked limit row).
 
 Usage:
   python -m loadtest.concurrency_probe --host http://localhost:8000
@@ -51,13 +44,8 @@ async def idempotency_race(client: httpx.AsyncClient, account_id: str, instrumen
     clean_replay = len(successes) == concurrency and len(order_ids) == 1
     if clean_replay:
         print("  PASS: every response replayed the same cached order, no duplicates, no errors.")
-    elif 500 in statuses:
-        print(
-            "  CONFIRMED FINDING: a concurrent identical-key request came back as a bare 500 instead of a "
-            "clean replay (idempotency_keys unique-constraint race - see .claude/context.md)."
-        )
     else:
-        print(f"  UNEXPECTED: {len(order_ids)} distinct order(s) created across {len(successes)} successful responses.")
+        print(f"  FAIL: {len(order_ids)} distinct order(s) across {len(successes)}/{concurrency} successful responses.")
     return clean_replay
 
 
@@ -113,14 +101,11 @@ async def concentration_limit_race(
 
     print(
         f"[concentration-limit race] {concurrency} simultaneous BUY orders of {per_order_qty} units each against "
-        f"a {limit}-unit limit -> {len(admitted)} admitted ({admitted_qty} units total); correct behavior would "
-        f"admit at most {max_should_admit}."
+        f"a {limit}-unit limit -> {len(admitted)} admitted ({admitted_qty} units total); at most "
+        f"{max_should_admit} may be admitted, fewer if open orders already use some of the limit."
     )
-    reproduced = len(admitted) > max_should_admit
-    if reproduced:
-        print("  CONFIRMED FINDING: over-admission past the concentration limit (see .claude/context.md).")
-    else:
-        print("  NOT REPRODUCED (unexpected - recheck app/services/order_placement.py).")
+    ok = len(admitted) <= max_should_admit
+    print("  PASS: limit held." if ok else "  FAIL: over-admission past the concentration limit.")
 
     # Clean up so repeated runs start from a clean limit.
     for order in admitted:
@@ -129,7 +114,7 @@ async def concentration_limit_race(
         etag = get_resp.headers.get("ETag")
         if etag:
             await client.post(f"/orders/{order_id}/cancel", headers={"Idempotency-Key": str(uuid.uuid4()), "If-Match": etag})
-    return reproduced
+    return ok
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -140,24 +125,20 @@ async def main(args: argparse.Namespace) -> None:
     api_key = config["keys"][0]["api_key"]
 
     async with httpx.AsyncClient(base_url=args.host, headers={"X-API-Key": api_key}, timeout=30.0) as client:
-        idempotency_replayed_cleanly = await idempotency_race(client, account_id, unrestricted_instrument_id, args.concurrency)
+        idempotency_ok = await idempotency_race(client, account_id, unrestricted_instrument_id, args.concurrency)
         print()
         etag_ok = await etag_race(client, account_id, unrestricted_instrument_id, args.concurrency)
         print()
-        concentration_race_reproduced = await concentration_limit_race(
+        concentration_ok = await concentration_limit_race(
             client, account_id, limited_instrument_id, args.concurrency, args.concentration_qty, args.concentration_limit
         )
 
     print()
-    print("Summary (matches the findings documented in .claude/context.md):")
-    print(f"  idempotency race   : {'PASS' if idempotency_replayed_cleanly else 'CONFIRMED FINDING (500 on concurrent retry)'}")
-    print(f"  etag/If-Match race : {'PASS' if etag_ok else 'FAIL (unexpected)'}")
-    print(f"  concentration race : {'CONFIRMED FINDING (over-admission)' if concentration_race_reproduced else 'PASS (unexpected)'}")
-
-    # Exit 0 iff reality matched the documented expectations; non-zero
-    # means something needs a closer look (good or bad surprise alike).
-    matches_expectations = (not idempotency_replayed_cleanly) and etag_ok and concentration_race_reproduced
-    raise SystemExit(0 if matches_expectations else 1)
+    print("Summary:")
+    print(f"  idempotency race   : {'PASS' if idempotency_ok else 'FAIL'}")
+    print(f"  etag/If-Match race : {'PASS' if etag_ok else 'FAIL'}")
+    print(f"  concentration race : {'PASS' if concentration_ok else 'FAIL'}")
+    raise SystemExit(0 if idempotency_ok and etag_ok and concentration_ok else 1)
 
 
 def parse_args() -> argparse.Namespace:
