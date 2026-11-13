@@ -1,0 +1,16 @@
+.git
+.github
+.claude
+.vscode
+.pytest_cache
+.ruff_cache
+terraform
+tests
+scripts
+docker-compose.yml
+README.md
+.env
+.env.example
+outbox_stream.jsonl
+*.pyc
+__pycache__

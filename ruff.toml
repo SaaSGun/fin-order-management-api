@@ -1,0 +1,7 @@
+line-length = 110
+
+[lint]
+# B008: FastAPI's `Depends(...)` default-argument pattern is idiomatic, not a bug.
+# FURB157: prefer Decimal("10.00") string literals everywhere for consistency,
+# even where ruff would accept the terser Decimal(10) form.
+ignore = ["B008", "FURB157"]
