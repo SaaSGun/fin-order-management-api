@@ -3,6 +3,8 @@
 .env
 .vscode/
 outbox_stream.jsonl
+loadtest/.keys*.json
+loadtest/results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
