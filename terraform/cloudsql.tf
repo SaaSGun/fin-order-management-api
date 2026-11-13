@@ -15,6 +15,10 @@ resource "google_sql_database_instance" "main" {
 
   settings {
     tier              = var.db_tier
+    # Shared-core tiers like db-f1-micro only exist under the Enterprise
+    # edition; without this, new projects can default to Enterprise Plus,
+    # which rejects db-f1-micro outright.
+    edition           = "ENTERPRISE"
     availability_type = "ZONAL"
 
     backup_configuration {

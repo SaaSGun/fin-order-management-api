@@ -2,6 +2,8 @@
 resource "google_service_account" "run_runtime" {
   account_id   = "${var.service_name}-run"
   display_name = "fin-oms-api Cloud Run runtime"
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_project_iam_member" "run_cloudsql_client" {
@@ -20,6 +22,8 @@ resource "google_secret_manager_secret_iam_member" "run_secret_access" {
 resource "google_service_account" "deployer" {
   account_id   = "${var.service_name}-deploy"
   display_name = "fin-oms-api GitHub Actions deployer"
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_project_iam_member" "deployer_run_admin" {
