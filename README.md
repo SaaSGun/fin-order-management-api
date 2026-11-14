@@ -1,56 +1,157 @@
 # Fin OMS API
 
-An Order Management System (OMS): order
-placement/lifecycle, execution, and position-keeping for client portfolios,
-on PostgreSQL. This is the OLTP counterpart to the sibling
-[fin-analytics-api](https://github.com/SaaSGun/fin-analytics-api) repo.
+An Order Management System (OMS) for a wealth manager: order placement
+and lifecycle, pre-trade compliance, executions, settlement, and
+position/cash keeping for client accounts — built to show transactional
+database design and concurrency control on PostgreSQL.
+
+It is the OLTP counterpart to
+[fin-analytics-api](https://github.com/SaaSGun/fin-analytics-api), which
+serves the same domain's analytics (OLAP) side from BigQuery with the same
+API conventions.
+
+**Stack**: Python 3.12, FastAPI, SQLAlchemy 2.0 (async, asyncpg), Alembic,
+PostgreSQL 16 — deployed on Cloud Run + Cloud SQL via Terraform and GitHub
+Actions.
 
 ## Live demo
 
-Deployed on Cloud Run: **https://fin-oms-api-miatwtkcba-ez.a.run.app**
+**https://fin-oms-api-miatwtkcba-ez.a.run.app**
 
-- [`/health`](https://fin-oms-api-miatwtkcba-ez.a.run.app/health) —
-  unauthenticated, confirms the service is up.
-- [`/docs`](https://fin-oms-api-miatwtkcba-ez.a.run.app/docs) — interactive
-  Swagger UI for the full API surface (every endpoint, request/response
-  schemas, scopes required).
+- [`/health`](https://fin-oms-api-miatwtkcba-ez.a.run.app/health) — no auth.
+- [`/docs`](https://fin-oms-api-miatwtkcba-ez.a.run.app/docs) — Swagger UI
+  for every endpoint, schema, and required scope.
 
-No API key is published here deliberately — this is a live production-like
-deployment with a real database behind it, and a key committed to a public
-repo is effectively public forever (scraped within minutes, even after
-later revoking it), so a write-capable key here would mean strangers
-mutating the same demo data. `/docs` is enough to see the full request/
-response shape, the pagination envelope, and the `401`/`403` behavior of
-the auth layer (`app/auth.py`) without needing one.
+API keys are deliberately not published in this repo (a key in a public
+repo is effectively public forever). Short-lived evaluation keys are
+issued on request.
 
-## The concurrency-control story (the point of this repo)
+## Five-minute tour
 
-Two mechanics carry the weight here, used side by side on purpose because
-they solve different problems:
+| Where | What it shows |
+|---|---|
+| [`app/services/order_placement.py`](app/services/order_placement.py) | Buying-power and position reservations under `SELECT ... FOR UPDATE`; concentration limits serialized on the locked limit row |
+| [`app/idempotency.py`](app/idempotency.py) | Idempotency keys, with a per-key advisory lock so concurrent retries replay instead of failing |
+| [`app/services/cancellation.py`](app/services/cancellation.py) | Optimistic locking: conditional `UPDATE ... WHERE version = :expected` |
+| [`app/services/execution.py`](app/services/execution.py) | A fill as one multi-table atomic transaction |
+| [`app/outbox.py`](app/outbox.py), [`scripts/outbox_relay.py`](scripts/outbox_relay.py) | Transactional outbox, relay safe across concurrent workers (`FOR UPDATE SKIP LOCKED`) |
+| [`tests/test_concurrency.py`](tests/test_concurrency.py) | Genuinely concurrent requests against a real Postgres, not mocks |
+| [`loadtest/`](loadtest/) | Locust portfolio-manager scenario and the race probe that found the two bugs described below |
+
+## Concurrency control
+
+Each mechanism is chosen for the failure behavior it gives, not applied
+uniformly:
 
 1. **Buying-power / position reservation.** `cash_balances.reserved_amount`
-   and `positions.reserved_quantity` turn "is there enough?" into a write,
-   not just a read — placing an order locks the relevant row
-   (`SELECT ... FOR UPDATE`) and increments its reservation in the same
-   transaction. Without this, two concurrent orders against the same
-   account would both read the same unreserved balance and both pass the
-   check; a row lock alone doesn't stop that, because nothing has changed
-   yet for the second reader to block on. See
-   [`app/services/order_placement.py`](app/services/order_placement.py).
-2. **Optimistic locking for order state transitions.** `orders.version`
-   backs a conditional `UPDATE ... WHERE version = :expected`; zero rows
-   affected means someone else changed the order first (e.g. it got filled
-   while a cancel was in flight) → `409 Conflict`. Used here instead of a
-   pessimistic lock because a conflicting *writer* should fail loudly, not
-   block and then apply a cancel that no longer makes sense. See
-   [`app/services/cancellation.py`](app/services/cancellation.py).
-3. Recording a fill ([`app/services/execution.py`](app/services/execution.py))
-   is one multi-table atomic transaction: order status/version, reservation
-   release, position (upsert + average cost), cash balance, a cash-ledger
-   row, and a settlement row, all in one commit.
+   and `positions.reserved_quantity` turn "is there enough?" into a write.
+   Placing an order locks the row (`SELECT ... FOR UPDATE`) and increments
+   the reservation in the same transaction. A lock alone isn't enough:
+   placing an order doesn't move cash, so once the first order commits,
+   the second still reads the same balance and passes too.
+2. **Concentration limits (pre-trade risk).** A BUY locks the matching
+   `concentration_limits` row, so concurrent orders against one limit are
+   admitted one at a time, first come first served. Exposure is held
+   quantity **plus open BUY orders**, read in a single statement so a fill
+   committing mid-check can't be counted twice or missed.
+3. **Optimistic locking for order state changes.** `orders.version` backs
+   a conditional `UPDATE ... WHERE version = :expected`; zero rows affected
+   means the order changed first (e.g. it was filled while a cancel was in
+   flight). Over HTTP this is `ETag` / `If-Match` → `412 Precondition
+   Failed`. Used instead of a row lock because a conflicting writer should
+   fail loudly and re-fetch, not wait and then apply a cancel that no
+   longer makes sense.
+4. **Atomic fills.** Recording an execution updates the order, releases
+   the reservation, upserts the position (with average cost), moves cash,
+   and writes a cash-ledger row and a settlement row — one commit.
+5. **Idempotency under concurrency.** Before looking up an
+   `Idempotency-Key`, the request takes a transaction-scoped Postgres
+   advisory lock on it. A simultaneous duplicate waits for the original to
+   commit, then returns its cached response instead of re-running the
+   operation.
 
-`tests/test_concurrency.py` exercises both mechanics with genuinely
-concurrent requests (`asyncio.gather`), not just sequential assertions.
+## Load testing — and the two race conditions it found
+
+[`loadtest/locustfile.py`](loadtest/locustfile.py) simulates portfolio
+managers checking positions, cash, and limits before trading (reads
+outnumber writes), each PM with their own API key.
+[`loadtest/concurrency_probe.py`](loadtest/concurrency_probe.py) fires
+genuinely simultaneous requests at each concurrency guarantee.
+
+**Throughput**
+
+| Environment | Load | Result |
+|---|---|---|
+| Local, single process (≈ one Cloud Run instance) | 10 → 100 PMs, 1–4 s think time | 0 failures, p99 ≤ 160 ms, ~37 req/s at 100 PMs |
+| Local, single process | 100 → 500 clients, near-zero think time | 0 failures; throughput plateaus at ~220–275 req/s and latency degrades gracefully (p50 ~180 ms at 100 → ~1.4 s at 500) rather than erroring |
+| Production (Cloud Run + Cloud SQL `db-f1-micro`) | 15 PMs, 2 min, 1–4 s think time | 792 requests, 0 failures, median 25 ms, p95 87 ms, p99 100 ms |
+
+**Race conditions found, then fixed**
+
+| Bug | Before the fix | After the fix (local) |
+|---|---|---|
+| Concentration limit checked only filled quantity, without a lock | 3 simultaneous 20-unit BUYs against a 50-unit limit: **all 3 admitted** (reproduced in production too) | 10 PMs racing 20-unit BUYs against the same limit: **exactly 2 admitted**, 8 rejected |
+| Idempotency key looked up once, before any lock | 3 simultaneous identical requests: **`[500, 500, 201]`** | 10 simultaneous identical requests: **one order**, every response the same replay |
+
+**Running it**
+
+```bash
+pip install -r requirements-dev.txt
+python -m scripts.provision_load_test_keys --count 100        # writes loadtest/.keys.json (gitignored)
+
+python -m loadtest.concurrency_probe --host http://localhost:8000
+locust -f loadtest/locustfile.py --host http://localhost:8000 --headless -u 25 -r 5 -t 3m
+LOADTEST_FAST=1 locust -f loadtest/locustfile.py ...          # near-zero think time, to find the ceiling
+```
+
+Valid keys are cached per process for 5 minutes, so restart the API (or
+wait) after provisioning new keys against a running server.
+
+## API
+
+Every response uses one envelope:
+`{"data": <object|array>, "meta": {"pagination": {...}|null}}`. List
+endpoints use keyset pagination (`cursor`, `limit`), so pages stay correct
+while rows change.
+
+| Method | Path | Scope | Notes |
+|---|---|---|---|
+| GET | `/health` | — | |
+| GET | `/clients/{client_id}` | read | |
+| GET | `/clients/{client_id}/accounts` | read | paginated |
+| GET | `/accounts/{account_id}` | read | |
+| GET | `/accounts/{account_id}/positions` | read | paginated |
+| GET | `/accounts/{account_id}/cash-balances` | read | paginated |
+| GET | `/accounts/{account_id}/summary` | read | valuation at cost |
+| GET | `/instruments` | read | paginated |
+| POST | `/orders` | trade | `Idempotency-Key` |
+| GET | `/orders?account_id=` | read | paginated |
+| GET | `/orders/{order_id}` | read | returns `ETag` |
+| POST | `/orders/{order_id}/cancel` | trade | `Idempotency-Key`, `If-Match` |
+| POST | `/orders/{order_id}/executions` | admin | `Idempotency-Key` — simulates a market fill |
+| GET | `/orders/{order_id}/executions` | read | paginated |
+| GET | `/orders/{order_id}/compliance-checks` | read | paginated |
+| GET | `/orders/{order_id}/status-history` | read | paginated |
+| GET | `/settlements/{settlement_id}` | read | returns `ETag` |
+| POST | `/settlements/{settlement_id}/settle` | admin | `Idempotency-Key`, `If-Match` |
+
+- **Auth**: `X-API-Key` header. Scopes: `read` (all GETs), `trade` (place
+  and cancel orders), `admin` (executions and settlement — back-office
+  actions a real client wouldn't have). Keys are stored SHA-256-hashed.
+- **Idempotency**: missing key → `422`; same key + same body → the cached
+  response; same key + different body → `409`.
+- **Optimistic concurrency**: missing `If-Match` → `428`; stale version →
+  `412`.
+- **Compliance rejections** (restricted list, concentration limit, buying
+  power) still return `201` with `status: "REJECTED"` and the reason —
+  the order was accepted and evaluated; the per-rule results are at
+  `/orders/{id}/compliance-checks`.
+- **Rate limiting**: per-key token bucket (5 req/s, burst 20), `429` with
+  `Retry-After`. `/health` and failed-auth requests don't consume tokens.
+- **Observability**: one structured JSON log line per request, with a
+  `request_id` (echoed from the caller or generated) that also tags the
+  domain-event log lines (`order_placed`, `order_rejected`,
+  `execution_recorded`, `order_cancelled`, ...).
 
 ## Schema
 
@@ -60,301 +161,111 @@ erDiagram
     ACCOUNTS ||--o{ ORDERS : places
     ACCOUNTS ||--o{ CASH_BALANCES : holds
     ACCOUNTS ||--o{ POSITIONS : holds
+    ACCOUNTS ||--o{ CONCENTRATION_LIMITS : "capped by"
     INSTRUMENTS ||--o{ ORDERS : "ordered"
     INSTRUMENTS ||--o{ POSITIONS : "held as"
+    INSTRUMENTS ||--o{ RESTRICTED_INSTRUMENTS : "may be restricted"
     ORDERS ||--o{ EXECUTIONS : "filled by"
     ORDERS ||--o{ ORDER_STATUS_HISTORY : "transitions"
     ORDERS ||--o{ COMPLIANCE_CHECKS : "checked by"
     EXECUTIONS ||--|| SETTLEMENTS : settles
     EXECUTIONS ||--o{ CASH_MOVEMENTS : "books"
-    INSTRUMENTS ||--o{ RESTRICTED_INSTRUMENTS : "may be restricted"
 ```
 
-14 tables, defined in [`app/models/`](app/models/) and created by the
-hand-written Alembic migration
-[`alembic/versions/0001_initial_schema.py`](alembic/versions/0001_initial_schema.py).
-Status/side/type columns use `CHECK` constraints rather than native
-Postgres `ENUM` types — enums require `ALTER TYPE ... ADD VALUE` for every
-new value down the line; `CHECK` constraints are trivially alterable and
-keep migrations simple. All primary keys are app-generated UUIDs
-(`uuid.uuid4()`), not a Postgres extension, to keep the migration
-dependency-free. Foreign keys are `ON DELETE RESTRICT` throughout — this is
-a ledger-shaped domain; nothing here should ever cascade-delete.
+14 domain tables (models in [`app/models/`](app/models/), hand-written
+Alembic migrations in [`alembic/versions/`](alembic/versions/)), plus
+`api_keys`, `idempotency_keys`, `outbox_events`, and `audit_log`.
 
-## Project structure
+- Status/side/type columns use `CHECK` constraints, not Postgres `ENUM`s,
+  which need `ALTER TYPE ... ADD VALUE` for every new value.
+- App-generated UUID primary keys, so migrations need no extension.
+- `ON DELETE RESTRICT` throughout — in a ledger-shaped domain nothing
+  should cascade-delete.
 
-```
-app/
-  config.py, db.py          # settings, async engine/session
-  main.py                    # FastAPI app, middleware, routers, /health
-  auth.py, rate_limit.py      # API-key auth + scopes, token-bucket rate limiting
-  pagination.py, etag.py       # cursor pagination, ETag/If-Match helpers
-  idempotency.py, audit.py,     # idempotency-key cache, audit trail, transactional
-    outbox.py                   #   outbox — see "Phase 2.5" below
-  observability.py                # structured JSON logging, request-ID middleware
-  models/                           # SQLAlchemy ORM models, one module per concern
-  schemas/                           # Pydantic request/response models (+ common.py: Envelope/Meta/Pagination)
-  services/                           # the transactional engine — the core of this repo
-  routers/                             # thin HTTP layer over services/
-alembic/                                # migrations
-scripts/                                  # seed_demo_data.py, manage_api_keys.py, outbox_relay.py
-tests/                                      # pytest, against a real Postgres (see below)
-terraform/                                    # GCP IaC — see "Deployment (Phase 3)" below
-.github/workflows/                              # ci.yml (lint+test), deploy.yml (build/migrate/deploy)
-Dockerfile, .dockerignore                         # container image for Cloud Run
-```
+**Outbox and audit trail.** Every service call writes an `outbox_events`
+row and an `audit_log` row (actor plus before/after state) in the **same
+transaction** as the business change, so neither can disagree with what
+actually committed. They're separate tables on purpose: the audit log is
+for a person asking "who did what" and is kept forever; the outbox feeds
+downstream systems, and the relay marks each row published once it's
+sent. No broker exists in
+this environment, so the relay publishes to a local `outbox_stream.jsonl`
+file; swapping in Kafka or Pub/Sub only touches `app/outbox.py`'s
+`Publisher`.
 
-## Setup
+## Running locally
 
-Python interpreter for this repo: `C:\Apps\Anaconda\fin_oms_api\python.exe`
-(conda env; see `.claude/claude.md`).
+Needs Python 3.12 and PostgreSQL 16.
 
-```
-C:\Apps\Anaconda\fin_oms_api\python.exe -m pip install -r requirements-dev.txt
-```
+```bash
+docker compose up -d                                        # Postgres on :5432, user/password fin_oms
+docker compose exec postgres createdb -U fin_oms fin_oms_test   # for the test suite
 
-### Local Postgres
-
-If Docker is available:
-
-```
-docker compose up -d
-```
-
-**This machine has neither Docker nor WSL installed**, so Postgres instead
-runs via a dedicated conda env with the `postgresql` conda-forge package —
-no admin rights needed, consistent with how the sibling repo's Python env
-also lives under `C:\Apps\Anaconda` rather than under the user profile
-(blocked by this machine's group policy):
-
-```
-conda create -p C:\Apps\Anaconda\fin_oms_db -c conda-forge postgresql=16 -y
-
-set BIN=C:\Apps\Anaconda\fin_oms_db\Library\bin
-set PGDATA=C:\Apps\Anaconda\fin_oms_db\pgdata
-%BIN%\initdb.exe -U postgres -A trust -E UTF8 --locale=C
-%BIN%\pg_ctl.exe -D %PGDATA% -l C:\Apps\Anaconda\fin_oms_db\pg.log start
-%BIN%\createuser.exe -U postgres -s fin_oms
-%BIN%\psql.exe -U postgres -c "ALTER USER fin_oms WITH PASSWORD 'fin_oms'"
-%BIN%\createdb.exe -U postgres -O fin_oms fin_oms
-%BIN%\createdb.exe -U postgres -O fin_oms fin_oms_test
-```
-
-Note the binaries live under `Library\bin`, not `Scripts` (conda's usual
-convention for pure-Python packages doesn't apply to this native-binary
-one). `-E UTF8 --locale=C` matters: the Windows default locale initializes
-the cluster as `WIN1252`, which can't store the non-ASCII characters this
-demo's seed data uses (e.g. an em dash). `PGDATA` must live outside the
-OneDrive-synced repo path — both because Windows group policy on this
-machine blocks executables launched from under the user profile/OneDrive,
-and because OneDrive syncing a live Postgres data directory mid-write
-would corrupt it.
-
-To stop it later: `%BIN%\pg_ctl.exe -D %PGDATA% stop`.
-
-### Migrations
-
-```
+pip install -r requirements-dev.txt
 alembic upgrade head
+python -m scripts.seed_demo_data                            # once, on a fresh DB; prints IDs and two API keys
+uvicorn app.main:app --reload                               # http://localhost:8000/docs
 ```
 
-### Seed demo data
+Without Docker, any Postgres 16 works: create the `fin_oms` and
+`fin_oms_test` databases, then set `DATABASE_URL` (format in
+[`.env.example`](.env.example)) and, for the tests, `TEST_DATABASE_URL`.
 
-```
-C:\Apps\Anaconda\fin_oms_api\python.exe scripts\seed_demo_data.py
-```
+More API keys: `python -m scripts.manage_api_keys create --client-name "pm-1" --scopes read,trade`
+(also `list` and `revoke`). Drain the outbox: `python -m scripts.outbox_relay`.
 
-Not idempotent — run it once against a fresh database. It prints a
-`read`-only API key and a `read`+`trade`+`admin` key at the end; on a
-database it's already been run against, issue more keys instead with
-`scripts/manage_api_keys.py create --client-name "..." --scopes read,trade`.
+**Tests** run against a real Postgres (`fin_oms_test`), deliberately not
+mocks — the thing under test is Postgres locking behavior, which no mock
+reproduces.
 
-### Run the API
-
-```
-C:\Apps\Anaconda\fin_oms_api\python.exe -m uvicorn app.main:app --reload
-```
-
-Then open `http://localhost:8000/docs` for interactive Swagger UI.
-
-## Running tests
-
-Tests run against a real Postgres database (`fin_oms_test` by default,
-override via `TEST_DATABASE_URL`) — **not mocks**, deliberately: the thing
-under test is Postgres-level locking behavior, which no mock can reproduce
-(a deviation from the sibling repo's fully-offline, mocked test strategy,
-which is the right call there but would defeat the purpose here).
-
-```
-C:\Apps\Anaconda\fin_oms_api\python.exe -m pytest
+```bash
+pytest
+ruff check .
 ```
 
-Lint: `C:\Apps\Anaconda\fin_oms_api\python.exe -m ruff check .`
+## Deployment
 
-## Known Phase-1 simplifications
+Cloud Run + Cloud SQL for PostgreSQL in `europe-west4`, all defined in
+[`terraform/`](terraform/).
 
-- No live market/pricing feed — `MARKET` orders require a caller-supplied
-  `reference_price`; account valuation (`GET /accounts/{id}/summary`) is
-  "at cost," not mark-to-market.
-- No short selling — `SELL` orders require an existing, sufficient position.
-- Settlement is a status lifecycle (`PENDING`/`SETTLED`/`FAILED`) via an
-  explicit admin endpoint (`POST /settlements/{id}/settle`), not an
-  automated T+2 scheduler — cash/positions already moved atomically at
-  fill time, so settlement here is operational tracking, not a second
-  money-movement step.
-- Concentration limits are an absolute max-position-quantity cap, not a
-  %-of-portfolio-value limit (which would need a live valuation engine).
-- No deployment infra yet — see the roadmap below.
+- **Always-on database**: Cloud SQL runs continuously on the smallest
+  shared-core tier (`db-f1-micro`) so the demo link always works; Cloud Run
+  scales to zero when idle.
+- **Connectivity**: Cloud Run's built-in Cloud SQL Unix-socket mount — no
+  sidecar or connector library; only `DATABASE_URL` differs from local.
+- **Secrets**: `DATABASE_URL` lives in Secret Manager and reaches Cloud Run
+  via `secret_key_ref`, never as a literal value in the service spec.
+- **CI/CD**: [`ci.yml`](.github/workflows/ci.yml) runs ruff and pytest
+  against a `postgres:16` service container on every push and PR.
+  [`deploy.yml`](.github/workflows/deploy.yml) builds and pushes the image,
+  runs `alembic upgrade head` through the Cloud SQL Auth Proxy, then
+  deploys. Migrations run as a separate step before the new revision, never
+  at container startup, so concurrent instances can't race them. GitHub
+  authenticates to GCP with Workload Identity Federation — no
+  service-account key exists.
+- **Image ownership**: Terraform creates the Cloud Run service once and
+  then ignores its image (`lifecycle.ignore_changes`); CI/CD owns every
+  deploy after that.
+- **Ingress** is public; the app's API-key scopes are the gate.
 
-## API maturity (Phase 2)
+### One-time bootstrap
 
-Mirrors the sibling repo's API-maturity choices, adapted for async
-FastAPI + Postgres instead of sync FastAPI + BigQuery:
+From any machine with `gcloud` and `terraform` (Google Cloud Shell has
+both), with this repo cloned:
 
-- **Response envelope + cursor pagination**: every endpoint returns
-  `{"data": <object|array>, "meta": {"pagination": {...}|null}}`
-  ([`app/schemas/common.py`](app/schemas/common.py)). List endpoints use
-  keyset (not offset) pagination via `cursor`/`limit` query params
-  ([`app/pagination.py`](app/pagination.py)) — results stay correct even
-  if rows change between page fetches. `/health` stays bare, unwrapped.
-- **API-key auth + scopes**: send `X-API-Key`. Three tiers —
-  `read` (every GET), `trade` (place/cancel an order — a real client's
-  access), `admin` (record an execution / settle — back-office actions
-  simulating the market and settlement, which a real client would never
-  have). Keys are SHA-256-hashed in the `api_keys` table, never stored
-  raw. Manage them with
-  [`scripts/manage_api_keys.py`](scripts/manage_api_keys.py)
-  (`create`/`list`/`revoke`); `scripts/seed_demo_data.py` also seeds a
-  `read`-only and a `read`+`trade`+`admin` demo key on a fresh database.
-- **Rate limiting**: per-client token bucket (5 req/s, burst 20 by
-  default), 429 + `Retry-After` on an empty bucket. `/health` and
-  failed-auth responses never consume a token.
-- **Structured logging**: every request logs one JSON line
-  (`app/observability.py`) with a `request_id` (echoed from the caller or
-  generated) that also tags the service-layer `domain_event` log lines
-  for that request (`order_placed`/`order_rejected`/`execution_recorded`/
-  `order_cancelled`/`cancellation_conflict`/`settlement_updated`) — this
-  repo's analog of the sibling's per-query BigQuery-cost logging, but
-  for OMS audit/ops visibility instead of query cost.
-
-## Idempotency, optimistic concurrency, outbox/CDC, audit trail (Phase 2.5)
-
-Four patterns worth having genuinely, not partially — each ties directly
-into the "transactional database design" this repo exists to showcase,
-so all four are implemented so the extra record (idempotency cache row /
-outbox row / audit row) is written in the **same transaction** as the
-business effect it describes — see each service's docstring in
-`app/services/` for exactly where.
-
-- **Idempotency keys**: `Idempotency-Key` is required on every mutating
-  endpoint (`POST /orders`, `/orders/{id}/cancel`,
-  `/orders/{id}/executions`, `/settlements/{id}/settle`) — `422` if
-  missing. Replaying the same key + body returns the cached response
-  without touching the database again; the same key with a *different*
-  body is `409`. See [`app/idempotency.py`](app/idempotency.py).
-- **Optimistic concurrency over HTTP**: `GET /orders/{id}` and
-  `GET /settlements/{id}` set `ETag: "<version>"`. Cancelling an order or
-  settling a settlement **requires** `If-Match` — `428` if missing, `412`
-  if the version has moved on. This is what makes the guarantee genuine
-  from the caller's point of view (staleness *they* could have observed),
-  not just an internal detail — see [`app/etag.py`](app/etag.py) and the
-  `version` columns on `orders`/`settlements`. Cash balances/positions
-  deliberately don't get this — nothing ever mutates one as a standalone
-  resource, so there'd be nothing to send `If-Match` against.
-- **Outbox pattern / CDC**: every service call stages one row in
-  `outbox_events`, same transaction as the business write. There's no
-  Kafka broker in this environment, so `scripts/outbox_relay.py` — safe
-  to run as multiple concurrent workers via `SELECT ... FOR UPDATE SKIP
-  LOCKED` — publishes to a local `outbox_stream.jsonl` file standing in
-  for a topic. Swapping in a real broker (Kafka, or GCP Pub/Sub, which
-  fits this project's deployment direction better) only ever touches
-  `app/outbox.py`'s `Publisher`, never the transactional-write side.
-- **Audit trail**: `audit_log` (immutable by convention — nothing here
-  ever updates or deletes a row in it) records who did what, with full
-  before/after state, for every order placement/rejection/fill/
-  cancellation and every settlement update. Deliberately a separate table
-  from `outbox_events`, even though both are written at the same moment
-  for the same operation — one is for a human investigator asking "what
-  happened and who did it" (kept forever), the other for a downstream
-  system consuming a change stream (archived once published).
-
-## Deployment (Phase 3)
-
-Cloud Run (`fin-oms-api`) + Cloud SQL for Postgres, both in
-`europe-west4`. Deliberately **always-on**, not spin-up-on-demand — a
-reviewer's link should work at any time — so Cloud SQL runs continuously
-on the smallest shared-core tier (`db-f1-micro`, no SLA, ~$8-10/month;
-an accepted tradeoff for a portfolio project, not a production system).
-Cloud Run itself still scales to zero when idle.
-
-- **`Dockerfile`**: multi-stage build, non-root runtime user,
-  `--no-access-log` on uvicorn (the structured request-logging middleware
-  from Phase 2 already covers that), respects Cloud Run's `$PORT`.
-- **Cloud SQL connectivity**: Cloud Run's native Cloud SQL integration
-  (a mounted `/cloudsql` Unix socket) — no sidecar proxy, no connector
-  library. `app/config.py` needed no change; only the `DATABASE_URL`
-  value differs between local `.env` and Cloud Run's env.
-- **Secrets**: the DB password never appears in the Cloud Run service
-  spec. Terraform writes the full `DATABASE_URL` (and, separately, the
-  raw password for CI's migration step) into Secret Manager; Cloud Run
-  sources its env var via `secret_key_ref`, not a literal value — see
-  [`terraform/secret_manager.tf`](terraform/secret_manager.tf).
-- **Migrations**: run from CI, as a distinct step *before* the new
-  revision deploys — never from inside the app container at startup
-  (concurrent instances racing `alembic upgrade head` is exactly what
-  that avoids). GitHub Actions has no VPC path to Cloud SQL, so
-  [`deploy.yml`](.github/workflows/deploy.yml) tunnels through the
-  Cloud SQL Auth Proxy to run `alembic upgrade head` against `localhost`.
-- **CI/CD**: [`ci.yml`](.github/workflows/ci.yml) runs `ruff` + the full
-  pytest suite against a `postgres:16` service container on every PR and
-  push (GitHub's runners have Docker even though this machine doesn't).
-  [`deploy.yml`](.github/workflows/deploy.yml) builds the image, pushes
-  it to Artifact Registry, runs migrations, then deploys — all
-  authenticated via keyless **Workload Identity Federation** (no
-  service-account JSON key ever exists), mirroring the sibling
-  `fin-analytics-api` repo's setup.
-- **IaC**: [`terraform/`](terraform/) owns the GCP project's APIs, the
-  Cloud SQL instance, Artifact Registry repo, Secret Manager secrets, the
-  two service accounts (Cloud Run runtime vs. GitHub Actions deployer),
-  the WIF pool/provider, and the Cloud Run service itself — whose
-  container `image` Terraform deliberately stops managing after the
-  first `apply` (`lifecycle.ignore_changes`), since CI/CD owns deploys
-  from then on. State is remote (GCS backend); `terraform apply` runs
-  from **Google Cloud Shell**, not this machine (the Terraform CLI can't
-  execute locally here — an AppLocker/WDAC restriction, not a code
-  issue).
-- **Ingress**: the Cloud Run service allows unauthenticated invocations
-  (`allUsers` as `roles/run.invoker`) — the app's own API-key scopes
-  (Phase 2) are the real gate; a second IAM-level gate in front of them
-  would only add friction for a reviewer, not security.
-
-### One-time manual bootstrap (not owned by CI/CD)
-
-0. **Get `terraform/` (and the rest of this commit) into Cloud Shell.**
-   Nothing is committed to this repo yet, so Cloud Shell can't just
-   `git clone` it. Either commit + push first, or upload the `terraform/`
-   folder into Cloud Shell manually (its editor supports drag-and-drop
-   upload) — your call, just don't skip this, `terraform init` has
-   nothing to run otherwise.
-1. `gcloud projects create <PROJECT_ID>`, then find your billing account
-   id with `gcloud billing accounts list` and link it:
+1. Create the project and link billing:
+   `gcloud projects create <PROJECT_ID>`, then
    `gcloud billing projects link <PROJECT_ID> --billing-account=<ACCOUNT_ID>`.
-2. Sanity-check the baseline APIs Terraform itself needs are on (new
-   projects usually have these already, but a fresh project can
-   occasionally lack `serviceusage.googleapis.com`, which blocks
-   Terraform from enabling anything else):
+2. Make sure the APIs Terraform itself needs are on:
    `gcloud services enable serviceusage.googleapis.com cloudresourcemanager.googleapis.com --project=<PROJECT_ID>`.
-3. Create the GCS bucket for Terraform remote state, e.g.
+3. Create the Terraform state bucket:
    `gcloud storage buckets create gs://<PROJECT_ID>-tfstate --location=europe-west4`.
-4. From Cloud Shell, in `terraform/`:
-   `terraform init -backend-config="bucket=<PROJECT_ID>-tfstate"`, then
-   `terraform plan -var project_id=<PROJECT_ID>` (review it), then
-   `terraform apply -var project_id=<PROJECT_ID>`. Cloud SQL instance
-   creation alone can take several minutes — that's normal.
-5. Copy five Terraform outputs plus four fixed values into the GitHub
-   repo's **Settings → Secrets and variables → Actions → Variables tab**
-   (not Secrets — `deploy.yml` reads these as `vars.*`, so a value saved
-   as a Secret instead will silently resolve empty):
+4. In `terraform/`: `terraform init -backend-config="bucket=<PROJECT_ID>-tfstate"`,
+   then `terraform plan -var project_id=<PROJECT_ID>` and
+   `terraform apply -var project_id=<PROJECT_ID>` (Cloud SQL creation takes
+   several minutes).
+5. In the GitHub repo, under **Settings → Secrets and variables → Actions
+   → Variables** (not Secrets — `deploy.yml` reads `vars.*`), set:
    - `GCP_PROJECT_ID` = `<PROJECT_ID>`
    - `GCP_REGION` = `europe-west4`
    - `GCP_SERVICE_NAME` = `fin-oms-api`
@@ -364,9 +275,21 @@ Cloud Run itself still scales to zero when idle.
    - `GCP_SQL_CONNECTION_NAME` ← `cloudsql_connection_name` output
    - `GCP_DEPLOYER_SA` ← `deployer_service_account_email` output
    - `GCP_WORKLOAD_IDENTITY_PROVIDER` ← `workload_identity_provider` output
-6. Push to `main` (or merge a PR into it) — `deploy.yml` takes it from
-   there. Confirm with `curl <cloud_run_url output>/health`.
+6. Push to `main`; `deploy.yml` takes it from there. Check with
+   `curl <cloud_run_url output>/health`.
 
-## Roadmap
+## Known simplifications
 
-Nothing currently planned beyond Phase 3.
+- No live pricing feed: `MARKET` orders take a caller-supplied
+  `reference_price`, and account valuation is at cost, not mark-to-market.
+- No short selling: a `SELL` needs an existing, sufficient position.
+- Settlement is a status lifecycle (`PENDING` / `SETTLED` / `FAILED`) set
+  through an admin endpoint, not a T+2 scheduler; cash and positions
+  already moved atomically at fill time.
+- Concentration limits are an absolute share-count cap, not a
+  %-of-portfolio-value limit (which would need a live valuation engine). If
+  both an instrument-level and an asset-class-level limit match, one is
+  applied, not necessarily the stricter.
+- Rate limits and the API-key cache are in memory, per process: with
+  several Cloud Run instances each enforces its own bucket, and a revoked
+  key can keep working for up to 5 minutes.
