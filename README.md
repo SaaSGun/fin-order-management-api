@@ -93,6 +93,22 @@ genuinely simultaneous requests at each concurrency guarantee.
 | Concentration limit checked only filled quantity, without a lock | 3 simultaneous 20-unit BUYs against a 50-unit limit: **all 3 admitted** (reproduced in production too) | 10 PMs racing 20-unit BUYs against the same limit: **exactly 2 admitted**, 8 rejected |
 | Idempotency key looked up once, before any lock | 3 simultaneous identical requests: **`[500, 500, 201]`** | 10 simultaneous identical requests: **one order**, every response the same replay |
 
+**Invariants after a production run**
+
+A production run sent ~15,400 requests from up to 500 concurrent clients,
+including ~1,450 accepted orders plus cancels. All of them were on one
+account, so every one contended for the same cash-balance rows. Afterwards:
+
+- **Concentration limit held:** AAPL exposure (held + open BUY orders) was
+  46 against its 50-unit limit.
+- **No lost updates on reservations:** cancelling the 57 orders still open
+  returned reserved cash from 99,600 EUR / 6,900 USD to exactly 0.00.
+  Every amount reserved was released once, by its own order.
+
+Both are checked by
+[`scripts/cancel_load_test_orders.py`](scripts/cancel_load_test_orders.py),
+which reports exposure and cash before cancelling.
+
 **Running it**
 
 ```bash
