@@ -26,7 +26,8 @@ import uuid
 from contextvars import ContextVar
 
 from fastapi import Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 logger = logging.getLogger("app.requests")
 domain_logger = logging.getLogger("app.domain")
@@ -75,6 +76,14 @@ async def request_logging_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         status = response.status_code
+    except PoolTimeoutError:
+        # Every pooled DB connection stayed busy for DB_POOL_TIMEOUT: the
+        # service is overloaded. The request never got a connection, so
+        # nothing ran - shed it with a fast, retryable 503, not a 500.
+        status = 503
+        response = JSONResponse(
+            {"detail": "service overloaded, retry shortly"}, status_code=503, headers={"Retry-After": "1"}
+        )
     except Exception as exc:  # noqa: BLE001 - last-resort handler; traceback is logged below
         # Answer the 500 here rather than re-raising to Starlette's outer
         # ServerErrorMiddleware, so the response still gets X-Request-ID.

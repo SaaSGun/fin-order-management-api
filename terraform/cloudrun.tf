@@ -6,6 +6,15 @@ resource "google_cloud_run_v2_service" "app" {
   template {
     service_account = google_service_account.run_runtime.email
 
+    # Connection budget. db-f1-micro allows 25 connections, 3 reserved for
+    # superusers -> 22. 3 instances x 6 pooled connections = 18, leaving 4
+    # for CI migrations and admin sessions through the Auth Proxy. Unbounded,
+    # 3 x (5 + 10 overflow) = 45 exhausted the database under load (README,
+    # "Load testing"). Raise both together if the tier changes.
+    scaling {
+      max_instance_count = 3
+    }
+
     containers {
       # Placeholder for the first `terraform apply`, before any image has
       # been pushed to Artifact Registry. CI/CD owns the image after that
@@ -25,6 +34,22 @@ resource "google_cloud_run_v2_service" "app" {
             version = "latest"
           }
         }
+      }
+
+      # Fixed pool, no overflow: the instance never opens more than its share
+      # of the budget above. A request that waits DB_POOL_TIMEOUT seconds for
+      # a connection gets a 503 + Retry-After (app/observability.py).
+      env {
+        name  = "DB_POOL_SIZE"
+        value = "6"
+      }
+      env {
+        name  = "DB_MAX_OVERFLOW"
+        value = "0"
+      }
+      env {
+        name  = "DB_POOL_TIMEOUT"
+        value = "10"
       }
 
       volume_mounts {
