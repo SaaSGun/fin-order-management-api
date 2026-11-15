@@ -102,7 +102,11 @@ python -m scripts.provision_load_test_keys --count 100        # writes loadtest/
 python -m loadtest.concurrency_probe --host http://localhost:8000
 locust -f loadtest/locustfile.py --host http://localhost:8000 --headless -u 25 -r 5 -t 3m
 LOADTEST_FAST=1 locust -f loadtest/locustfile.py ...          # near-zero think time, to find the ceiling
+python -m scripts.cancel_load_test_orders --revoke-keys       # afterwards: limit check, cancel open orders, revoke keys
 ```
+
+[`loadtest/run_production.sh`](loadtest/run_production.sh) is the whole
+production run (keys, probe, Locust, cleanup), run from Cloud Shell.
 
 Valid keys are cached per process for 5 minutes, so restart the API (or
 wait) after provisioning new keys against a running server.

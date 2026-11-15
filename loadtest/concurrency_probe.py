@@ -49,7 +49,9 @@ async def idempotency_race(client: httpx.AsyncClient, account_id: str, instrumen
     return clean_replay
 
 
-async def etag_race(client: httpx.AsyncClient, account_id: str, instrument_id: str, concurrency: int) -> bool:
+async def etag_race(
+    client: httpx.AsyncClient, account_id: str, instrument_id: str, concurrency: int, api_keys: list[str]
+) -> bool:
     create = await client.post(
         "/orders",
         json={**_ORDER_PAYLOAD, "account_id": account_id, "instrument_id": instrument_id, "quantity": "1", "reference_price": "100.00"},
@@ -59,12 +61,13 @@ async def etag_race(client: httpx.AsyncClient, account_id: str, instrument_id: s
     get_resp = await client.get(f"/orders/{order_id}")
     etag = get_resp.headers["ETag"]
 
-    async def fire():
+    async def fire(i: int):
         return await client.post(
-            f"/orders/{order_id}/cancel", headers={"Idempotency-Key": str(uuid.uuid4()), "If-Match": etag}
+            f"/orders/{order_id}/cancel",
+            headers={"Idempotency-Key": str(uuid.uuid4()), "If-Match": etag, "X-API-Key": api_keys[i % len(api_keys)]},
         )
 
-    responses = await asyncio.gather(*[fire() for _ in range(concurrency)])
+    responses = await asyncio.gather(*[fire(i) for i in range(concurrency)])
     statuses = [r.status_code for r in responses]
     ok = statuses.count(200) == 1 and all(s in (200, 412) for s in statuses)
     print(f"[etag race] {concurrency} simultaneous cancels, identical If-Match -> statuses {statuses} ({'PASS' if ok else 'FAIL'})")
@@ -78,8 +81,9 @@ async def concentration_limit_race(
     concurrency: int,
     per_order_qty: int,
     limit: int,
+    api_keys: list[str],
 ) -> bool:
-    async def fire():
+    async def fire(i: int):
         return await client.post(
             "/orders",
             json={
@@ -89,10 +93,10 @@ async def concentration_limit_race(
                 "quantity": str(per_order_qty),
                 "reference_price": "150.00",
             },
-            headers={"Idempotency-Key": str(uuid.uuid4())},
+            headers={"Idempotency-Key": str(uuid.uuid4()), "X-API-Key": api_keys[i % len(api_keys)]},
         )
 
-    responses = await asyncio.gather(*[fire() for _ in range(concurrency)])
+    responses = await asyncio.gather(*[fire(i) for i in range(concurrency)])
     admitted = [
         r.json()["data"] for r in responses if r.status_code == 201 and r.json()["data"]["status"] != "REJECTED"
     ]
@@ -122,15 +126,24 @@ async def main(args: argparse.Namespace) -> None:
     account_id = config["account_id"]
     limited_instrument_id = config["limited_instrument_id"]
     unrestricted_instrument_id = config["unrestricted_instrument_id"]
-    api_key = config["keys"][0]["api_key"]
+    # The idempotency race stays on one key (a retrying client - keys are
+    # scoped per client); the other races spread across keys, one PM each,
+    # which also keeps them under the per-key rate limit at higher concurrency.
+    api_keys = [k["api_key"] for k in config["keys"]]
 
-    async with httpx.AsyncClient(base_url=args.host, headers={"X-API-Key": api_key}, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=args.host, headers={"X-API-Key": api_keys[0]}, timeout=30.0) as client:
         idempotency_ok = await idempotency_race(client, account_id, unrestricted_instrument_id, args.concurrency)
         print()
-        etag_ok = await etag_race(client, account_id, unrestricted_instrument_id, args.concurrency)
+        etag_ok = await etag_race(client, account_id, unrestricted_instrument_id, args.concurrency, api_keys)
         print()
         concentration_ok = await concentration_limit_race(
-            client, account_id, limited_instrument_id, args.concurrency, args.concentration_qty, args.concentration_limit
+            client,
+            account_id,
+            limited_instrument_id,
+            args.concurrency,
+            args.concentration_qty,
+            args.concentration_limit,
+            api_keys,
         )
 
     print()
