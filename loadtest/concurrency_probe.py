@@ -30,6 +30,20 @@ _ORDER_PAYLOAD = {
 }
 
 
+async def warm_up(client: httpx.AsyncClient, concurrency: int) -> None:
+    """Opens the racing connections before any race, with retries: the races
+    then run on warm keep-alive connections, so requests really arrive
+    together and a flaky resolver can't fail one racer mid-race."""
+    for _ in range(5):
+        try:
+            await asyncio.gather(*[client.get("/health") for _ in range(concurrency)])
+            return
+        except httpx.ConnectError as exc:
+            print(f"warm-up: {exc!r}, retrying")
+            await asyncio.sleep(2)
+    raise SystemExit("could not open connections to the API")
+
+
 async def idempotency_race(client: httpx.AsyncClient, account_id: str, instrument_id: str, concurrency: int) -> bool:
     key = str(uuid.uuid4())
     payload = {**_ORDER_PAYLOAD, "account_id": account_id, "instrument_id": instrument_id, "quantity": "1", "reference_price": "100.00"}
@@ -131,7 +145,11 @@ async def main(args: argparse.Namespace) -> None:
     # which also keeps them under the per-key rate limit at higher concurrency.
     api_keys = [k["api_key"] for k in config["keys"]]
 
-    async with httpx.AsyncClient(base_url=args.host, headers={"X-API-Key": api_keys[0]}, timeout=30.0) as client:
+    limits = httpx.Limits(keepalive_expiry=60)
+    async with httpx.AsyncClient(
+        base_url=args.host, headers={"X-API-Key": api_keys[0]}, timeout=30.0, limits=limits
+    ) as client:
+        await warm_up(client, args.concurrency)
         idempotency_ok = await idempotency_race(client, account_id, unrestricted_instrument_id, args.concurrency)
         print()
         etag_ok = await etag_race(client, account_id, unrestricted_instrument_id, args.concurrency, api_keys)

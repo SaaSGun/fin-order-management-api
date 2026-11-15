@@ -45,7 +45,8 @@ async def main():
     c = await asyncpg.connect(os.environ["DATABASE_URL"].replace("+asyncpg", ""))
     print("max_connections:", await c.fetchval("SHOW max_connections"),
           "| superuser_reserved:", await c.fetchval("SHOW superuser_reserved_connections"),
-          "| open now:", await c.fetchval("SELECT count(*) FROM pg_stat_activity"))
+          "| client connections now:",
+          await c.fetchval("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'"))
     await c.close()
 asyncio.run(main())
 EOF
