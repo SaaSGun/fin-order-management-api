@@ -48,6 +48,13 @@ async def cancel_order(
     order = result.scalars().first()
     if order is None:
         raise CancellationError("order not found")
+    # The caller's precondition is evaluated before anything else (RFC 9110
+    # §13.2.2): a stale If-Match is a 412 even when the order has meanwhile
+    # become uncancellable, so the losers of a cancel race all get the same
+    # answer instead of 412 or 422 depending on timing.
+    if expected_version is not None and order.version != expected_version:
+        log_domain_event("cancellation_conflict", order_id=str(order_id), expected_version=expected_version)
+        raise CancellationConflict("order was modified concurrently (filled or already cancelled); refetch and retry")
     if order.status not in (OrderStatus.NEW.value, OrderStatus.PARTIALLY_FILLED.value):
         raise CancellationError(f"order is {order.status}, cannot be cancelled")
 
