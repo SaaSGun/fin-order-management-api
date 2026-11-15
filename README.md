@@ -36,7 +36,7 @@ issued on request.
 | [`app/services/execution.py`](app/services/execution.py) | A fill as one multi-table atomic transaction |
 | [`app/outbox.py`](app/outbox.py), [`scripts/outbox_relay.py`](scripts/outbox_relay.py) | Transactional outbox, relay safe across concurrent workers (`FOR UPDATE SKIP LOCKED`) |
 | [`tests/test_concurrency.py`](tests/test_concurrency.py) | Genuinely concurrent requests against a real Postgres, not mocks |
-| [`loadtest/`](loadtest/) | Locust portfolio-manager scenario and the race probe that found the two bugs described below |
+| [`loadtest/`](loadtest/) | Locust portfolio-manager scenario, the race probe, and the production run behind the numbers below |
 
 ## Concurrency control
 
@@ -70,44 +70,103 @@ uniformly:
    commit, then returns its cached response instead of re-running the
    operation.
 
-## Load testing — and the two race conditions it found
+## Load testing — and what it found
 
 [`loadtest/locustfile.py`](loadtest/locustfile.py) simulates portfolio
 managers checking positions, cash, and limits before trading (reads
 outnumber writes), each PM with their own API key.
 [`loadtest/concurrency_probe.py`](loadtest/concurrency_probe.py) fires
 genuinely simultaneous requests at each concurrency guarantee.
+[`loadtest/run_production.sh`](loadtest/run_production.sh) runs both
+against the live deployment.
 
-**Throughput**
+**Production throughput**
 
-| Environment | Load | Result |
+Cloud Run (up to 3 instances, 1 vCPU each) and Cloud SQL `db-f1-micro`
+(shared core). Each row ran for 2 minutes against one account.
+
+| Load | Requests | Failed | Throughput | p50 / p95 / p99 |
+|---|---|---|---|---|
+| 100 PMs, 1–4 s think time | 4,519 | 7 (0.2%) | 38 req/s | 29 ms / 100 ms / 1.2 s |
+| 100 clients, near-zero think time | 17,583 | 10 (0.06%) | 147 req/s | 300 ms / 2.1 s / 4.8 s |
+| 250 clients, near-zero think time | 7,165 | 280 (3.9%) | 60 req/s | 3.6 s / 10 s / 12 s |
+| 500 clients, near-zero think time | 6,882 | 312 (4.5%) | 58 req/s | 6.9 s / 19 s / 22 s |
+
+Cloud Run's request log shows **no `500`** during the run. Of the 609
+failed requests, at least 591 were `503` load shedding and 11 were DNS
+errors on the load generator. Past saturation, requests queue, and any
+request that can't get a database connection within 10 s is answered
+`503` with `Retry-After`.
+
+Throughput peaks around 150 req/s and falls to ~60 req/s from 250
+clients up. This test is the worst case for contention: every order goes
+to the same account. Order placements therefore queue on one
+cash-balance row lock, each holding a pooled connection while it waits,
+which is the likely cause of the drop. Spreading clients across accounts
+is the next experiment.
+
+Locally, a single process (≈ one Cloud Run instance against a local
+Postgres) served 10 → 100 paced PMs with p99 ≤ 160 ms. It plateaued at
+~220–275 req/s under 100 → 500 near-zero-think-time clients without
+failures.
+
+**Found under load: database connection exhaustion**
+
+| 2 min, near-zero think time | Before the fix | After the fix |
 |---|---|---|
-| Local, single process (≈ one Cloud Run instance) | 10 → 100 PMs, 1–4 s think time | 0 failures, p99 ≤ 160 ms, ~37 req/s at 100 PMs |
-| Local, single process | 100 → 500 clients, near-zero think time | 0 failures; throughput plateaus at ~220–275 req/s and latency degrades gracefully (p50 ~180 ms at 100 → ~1.4 s at 500) rather than erroring |
-| Production (Cloud Run + Cloud SQL `db-f1-micro`) | 15 PMs, 2 min, 1–4 s think time | 792 requests, 0 failures, median 25 ms, p95 87 ms, p99 100 ms |
+| 100 clients | **58% `500`**, 49 req/s, p99 23 s | 0.03% `503`, **147 req/s**, p99 4.8 s |
+| 500 clients | **81% `500`**, 21 req/s, p99 53 s | 4.5% `503`, 58 req/s, p99 22 s |
+
+Cloud Run scaled to 3 instances. Each had SQLAlchemy's default pool (5
+connections + 10 overflow), so they could open up to 45 connections, but
+`db-f1-micro` allows 22 for non-superusers. Postgres refused connections
+(`too many clients`). Requests that did queue for a pooled connection
+waited 30 s, then failed. Even the load test's own cleanup couldn't
+connect afterwards.
+
+The fix is a connection budget: 3 instances × 6 connections, no overflow
+= 18, which leaves room for migrations and admin sessions
+([`terraform/cloudrun.tf`](terraform/cloudrun.tf)). A request that waits
+more than 10 s for a connection now gets `503` with `Retry-After`
+([`app/observability.py`](app/observability.py)). Fewer connections gave
+three times the throughput. The most likely reason is that a fixed pool
+of persistent connections replaced connections being opened and closed
+under load on a shared-core database.
 
 **Race conditions found, then fixed**
 
-| Bug | Before the fix | After the fix (local) |
+| Bug | Before the fix | After the fix (production, 10 PMs) |
 |---|---|---|
-| Concentration limit checked only filled quantity, without a lock | 3 simultaneous 20-unit BUYs against a 50-unit limit: **all 3 admitted** (reproduced in production too) | 10 PMs racing 20-unit BUYs against the same limit: **exactly 2 admitted**, 8 rejected |
-| Idempotency key looked up once, before any lock | 3 simultaneous identical requests: **`[500, 500, 201]`** | 10 simultaneous identical requests: **one order**, every response the same replay |
+| Concentration limit checked only filled quantity, without a lock | 3 simultaneous 20-unit BUYs against a 50-unit limit: **all 3 admitted** (in production) | 10 simultaneous 20-unit BUYs against the same limit: **exactly 2 admitted** |
+| Idempotency key looked up once, before any lock | 3 simultaneous identical requests: **`[500, 500, 201]`** | 10 simultaneous identical requests: **one order**, ten identical `201` replays |
+| Cancel checked the order's status before the caller's `If-Match` | 10 simultaneous cancels with one ETag: losers got `412` or `422` depending on timing | `[200, 412 × 9]` — the precondition is evaluated first |
 
-**Invariants after a production run**
+The probe also showed that every write cost two rate-limit tokens. The
+scope dependency was declared twice, so auth and rate limiting ran twice,
+and bursts hit `429` at the 11th write instead of the documented 21st.
 
-A production run sent ~15,400 requests from up to 500 concurrent clients,
-including ~1,450 accepted orders plus cancels. All of them were on one
-account, so every one contended for the same cash-balance rows. Afterwards:
+**Invariants after the production runs**
 
-- **Concentration limit held:** AAPL exposure (held + open BUY orders) was
-  46 against its 50-unit limit.
-- **No lost updates on reservations:** cancelling the 57 orders still open
-  returned reserved cash from 99,600 EUR / 6,900 USD to exactly 0.00.
-  Every amount reserved was released once, by its own order.
+Every order in both runs went to one account. So every placement and
+cancel contended for the same cash-balance rows, from up to 500
+concurrent clients.
+[`scripts/cancel_load_test_orders.py`](scripts/cancel_load_test_orders.py)
+checks the state after each run: it reports exposure and cash, then
+cancels the orders left open.
 
-Both are checked by
-[`scripts/cancel_load_test_orders.py`](scripts/cancel_load_test_orders.py),
-which reports exposure and cash before cancelling.
+| | Run 1 (before the connection fix) | Run 2 (after) |
+|---|---|---|
+| Requests / accepted orders | ~15,400 / ~1,450 | ~36,100 / ~6,100 |
+| AAPL exposure vs its 50-unit limit | 46 — **held** | 49 — **held** |
+| Reserved cash after cancelling every open order | **0.00** EUR and USD (57 orders) | **0.00** EUR and USD (73 orders) |
+
+Reserved cash reaching exactly zero means every reservation belonged to
+an open order and was released once. No concurrent update to the shared
+cash rows was lost.
+
+In run 2, the cleanup started while requests queued in Cloud Run were
+still completing. Ten late orders were placed after it had listed the
+open orders, so it now waits for the queue to drain.
 
 **Running it**
 
@@ -168,6 +227,9 @@ while rows change.
   `/orders/{id}/compliance-checks`.
 - **Rate limiting**: per-key token bucket (5 req/s, burst 20), `429` with
   `Retry-After`. `/health` and failed-auth requests don't consume tokens.
+- **Overload**: if no database connection frees up within 10 s, the API
+  returns `503` with `Retry-After`. The request did nothing, so it is
+  safe to retry.
 - **Observability**: one structured JSON log line per request, with a
   `request_id` (echoed from the caller or generated) that also tags the
   domain-event log lines (`order_placed`, `order_rejected`,

@@ -73,6 +73,13 @@ for users in $FAST_USERS; do
     --csv "$OUT/fast-$users" > "$OUT/fast-$users.log" 2>&1
 done
 
+# Requests queued in Cloud Run keep completing for up to ~30 s after Locust
+# stops. Cleaning up while they drain lets a late order slip in after the
+# cleanup has listed the open orders (seen in a run: 10 late orders kept
+# 12,500 EUR reserved), so wait them out first.
+step "draining queued requests (60s)"
+sleep 60
+
 step "5. did the concentration limit hold under load? then cancel + revoke"
 python -m scripts.cancel_load_test_orders --revoke-keys | tee "$OUT/cleanup-after.txt"
 
