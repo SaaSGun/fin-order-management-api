@@ -23,8 +23,10 @@ Actions.
   for every endpoint, schema, and required scope.
 
 API keys are deliberately not published in this repo (a key in a public
-repo is effectively public forever). Short-lived evaluation keys are
-issued on request.
+repo is effectively public forever). Evaluation keys, which expire after
+a week, are issued on request. Each comes with an account of its own and
+the [playground notebook](https://github.com/SaaSGun/fin-api-playground),
+which runs the scenarios below against the live API from Colab.
 
 ## Five-minute tour
 
@@ -212,11 +214,13 @@ while rows change.
 | GET | `/orders/{order_id}/compliance-checks` | read | paginated |
 | GET | `/orders/{order_id}/status-history` | read | paginated |
 | GET | `/settlements/{settlement_id}` | read | returns `ETag` |
+| GET | `/executions/{execution_id}/settlement` | read | the settlement a fill created; returns `ETag` |
 | POST | `/settlements/{settlement_id}/settle` | admin | `Idempotency-Key`, `If-Match` |
 
 - **Auth**: `X-API-Key` header. Scopes: `read` (all GETs), `trade` (place
   and cancel orders), `admin` (executions and settlement — back-office
-  actions a real client wouldn't have). Keys are stored SHA-256-hashed.
+  actions a real client wouldn't have). Keys are stored SHA-256-hashed and
+  can carry an expiry, which is checked on every request.
 - **Idempotency**: missing key → `422`; same key + same body → the cached
   response; same key + different body → `409`.
 - **Optimistic concurrency**: missing `If-Match` → `428`; stale version →
@@ -318,8 +322,9 @@ Cloud Run + Cloud SQL for PostgreSQL in `europe-west4`, all defined in
 - **Secrets**: `DATABASE_URL` lives in Secret Manager and reaches Cloud Run
   via `secret_key_ref`, never as a literal value in the service spec.
 - **CI/CD**: [`ci.yml`](.github/workflows/ci.yml) runs ruff and pytest
-  against a `postgres:16` service container on every push and PR.
-  [`deploy.yml`](.github/workflows/deploy.yml) builds and pushes the image,
+  against a `postgres:16` service container on every PR and as the first
+  job of every deploy. [`deploy.yml`](.github/workflows/deploy.yml) runs
+  only if those checks pass: it builds and pushes the image,
   runs `alembic upgrade head` through the Cloud SQL Auth Proxy, then
   deploys. Migrations run as a separate step before the new revision, never
   at container startup, so concurrent instances can't race them. GitHub

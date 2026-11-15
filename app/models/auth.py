@@ -18,3 +18,6 @@ class ApiKey(Base):
     scopes: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # NULL = never expires. Checked per request (app/auth.py), not only when
+    # the key cache loads, so a key stops working at its expiry time.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

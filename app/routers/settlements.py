@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_scopes
@@ -33,6 +34,22 @@ def _settlement_body(settlement: Settlement) -> dict:
 @router.get("/settlements/{settlement_id}", response_model=Envelope[SettlementOut], dependencies=[read])
 async def get_settlement(settlement_id: uuid.UUID, response: Response, session: AsyncSession = Depends(get_session)):
     settlement = await session.get(Settlement, settlement_id)
+    if settlement is None:
+        raise HTTPException(status_code=404, detail="settlement not found")
+    response.headers["ETag"] = etag_for(settlement.version)
+    return Envelope(data=settlement)
+
+
+@router.get(
+    "/executions/{execution_id}/settlement", response_model=Envelope[SettlementOut], dependencies=[read]
+)
+async def get_settlement_for_execution(
+    execution_id: uuid.UUID, response: Response, session: AsyncSession = Depends(get_session)
+):
+    # Every execution creates exactly one settlement in the same transaction
+    # (unique on execution_id); this is how a client finds it after a fill.
+    result = await session.execute(select(Settlement).where(Settlement.execution_id == execution_id))
+    settlement = result.scalars().first()
     if settlement is None:
         raise HTTPException(status_code=404, detail="settlement not found")
     response.headers["ETag"] = etag_for(settlement.version)

@@ -5,6 +5,7 @@
 outbox_stream.jsonl
 loadtest/.keys*.json
 loadtest/results/
+.terraform/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

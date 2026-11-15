@@ -2,8 +2,9 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  # deploy.yml calls this workflow as its first job on every push to main,
+  # so the checks run once there and gate the deploy.
+  workflow_call:
 
 jobs:
   test:
