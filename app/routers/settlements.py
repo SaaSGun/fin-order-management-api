@@ -45,7 +45,7 @@ async def settle_settlement(
     payload: SettleRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    client_name: str = Depends(require_scopes("admin")),
+    client_name: str = admin,  # same object as dependencies=[admin]: FastAPI resolves it once per request
 ):
     idempotency_key = require_idempotency_key(request)
     expected_version = require_if_match(request)

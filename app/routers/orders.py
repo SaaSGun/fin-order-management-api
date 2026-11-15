@@ -55,7 +55,7 @@ async def create_order(
     payload: OrderCreate,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    client_name: str = Depends(require_scopes("trade")),
+    client_name: str = trade,  # same object as dependencies=[trade]: FastAPI resolves it once per request
 ):
     if payload.order_type == OrderType.LIMIT and payload.limit_price is None:
         raise HTTPException(status_code=422, detail="limit_price is required for LIMIT orders")
@@ -144,7 +144,7 @@ async def cancel(
     order_id: uuid.UUID,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    client_name: str = Depends(require_scopes("trade")),
+    client_name: str = trade,  # same object as dependencies=[trade]: FastAPI resolves it once per request
 ):
     idempotency_key = require_idempotency_key(request)
     expected_version = require_if_match(request)
@@ -190,7 +190,7 @@ async def create_execution(
     payload: ExecutionCreate,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    client_name: str = Depends(require_scopes("admin")),
+    client_name: str = admin,  # same object as dependencies=[admin]: FastAPI resolves it once per request
 ):
     idempotency_key = require_idempotency_key(request)
     request_hash = hash_body(await request.body())
